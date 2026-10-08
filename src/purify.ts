@@ -392,6 +392,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
 
+  /* Pristine allowlist bindings captured at setConfig() time. On the
+   * persistent-config path sanitize() restores the sets from these before
+   * the per-walk hook clone-guard, so a hook's in-call widening cannot
+   * carry across calls. Null until setConfig() is called; reset by
+   * clearConfig(). */
+  let SET_CONFIG_ALLOWED_TAGS = null;
+  let SET_CONFIG_ALLOWED_ATTR = null;
+
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
   let FORCE_BODY = false;
@@ -547,6 +555,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   /* Keep a reference to config to pass to hooks */
   let CONFIG: Config | null = null;
 
+  /* Pristine allowlist bindings of the last full _parseConfig() run. When
+   * the very same CONFIG object is handed back (hooks receive it as their
+   * third argument), _parseConfig() returns early without re-deriving the
+   * sets, so it restores them from these instead of keeping the previous
+   * walk's hook-mutable clone. */
+  let PARSED_ALLOWED_TAGS = null;
+  let PARSED_ALLOWED_ATTR = null;
+
   /* Ideally, do not touch anything below this line */
   /* ______________________________________________ */
 
@@ -566,6 +582,11 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   // eslint-disable-next-line complexity
   const _parseConfig = function (cfg: Config = {}): void {
     if (CONFIG && CONFIG === cfg) {
+      /* Same config object as the last parse: nothing below runs, so rebind
+       * the allowlists to that parse's pristine sets. Otherwise a hook's
+       * widening of the previous walk's clone would carry into this call. */
+      ALLOWED_TAGS = PARSED_ALLOWED_TAGS;
+      ALLOWED_ATTR = PARSED_ALLOWED_ATTR;
       return;
     }
 
@@ -888,36 +909,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
     }
 
-    /*
-     * Mirror the clone-before-mutate pattern already applied above for
-     * cfg.ADD_TAGS / cfg.ADD_ATTR: if any uponSanitize* hook is
-     * registered AND the set still points at the default constant,
-     * clone it. The hook then mutates the clone (in-call widening
-     * still works exactly as documented) and the next default-cfg
-     * call rebinds to the untouched original via the reassignment at
-     * the top of this function.
-     */
-    if (
-      (hooks.uponSanitizeElement.length > 0 ||
-        hooks.uponSanitizeAttribute.length > 0) &&
-      ALLOWED_TAGS === DEFAULT_ALLOWED_TAGS
-    ) {
-      ALLOWED_TAGS = clone(ALLOWED_TAGS);
-    }
-
-    if (
-      hooks.uponSanitizeAttribute.length > 0 &&
-      ALLOWED_ATTR === DEFAULT_ALLOWED_ATTR
-    ) {
-      ALLOWED_ATTR = clone(ALLOWED_ATTR);
-    }
-
     // Prevent further manipulation of configuration.
     // Not available in IE8, Safari 5, etc.
     if (freeze) {
       freeze(cfg);
     }
 
+    PARSED_ALLOWED_TAGS = ALLOWED_TAGS;
+    PARSED_ALLOWED_ATTR = ALLOWED_ATTR;
     CONFIG = cfg;
   };
 
@@ -2083,30 +2082,34 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
     /* Assign config vars */
     if (SET_CONFIG) {
-      /*
-       * Persistent setConfig() path: _parseConfig() is skipped, so its
-       * clone-before-mutate guard never sees hooks registered after
-       * setConfig(). Apply the same guard here so a hook cannot write
-       * through data.allowedTags / data.allowedAttributes into the
-       * default allowlist constants, which would otherwise survive
-       * removeAllHooks() and clearConfig().
-       */
-      if (
-        (hooks.uponSanitizeElement.length > 0 ||
-          hooks.uponSanitizeAttribute.length > 0) &&
-        ALLOWED_TAGS === DEFAULT_ALLOWED_TAGS
-      ) {
-        ALLOWED_TAGS = clone(ALLOWED_TAGS);
-      }
-
-      if (
-        hooks.uponSanitizeAttribute.length > 0 &&
-        ALLOWED_ATTR === DEFAULT_ALLOWED_ATTR
-      ) {
-        ALLOWED_ATTR = clone(ALLOWED_ATTR);
-      }
+      /* Persistent setConfig() path: _parseConfig is skipped, so the sets are
+       * not re-derived per call. Restore them from the pristine bindings
+       * captured at setConfig() time so a previous call's hook clone (mutated
+       * below) does not carry over. */
+      ALLOWED_TAGS = SET_CONFIG_ALLOWED_TAGS;
+      ALLOWED_ATTR = SET_CONFIG_ALLOWED_ATTR;
     } else {
       _parseConfig(cfg);
+    }
+
+    /* Clone the hook-mutable allowlists before the walk whenever an
+     * uponSanitize* hook is registered. The hook event exposes ALLOWED_TAGS
+     * and ALLOWED_ATTR by reference (as allowedTags / allowedAttributes), so
+     * a hook that widens them would otherwise mutate the shared set
+     * permanently: across later calls and across every element. Cloning per
+     * walk keeps documented in-call widening working while scoping it to the
+     * call. A single guard for both config paths - the per-call path rebinds
+     * the sets in _parseConfig each call, the persistent path restores them
+     * from the captured bindings just above - so the two cannot diverge. */
+    if (
+      hooks.uponSanitizeElement.length > 0 ||
+      hooks.uponSanitizeAttribute.length > 0
+    ) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (hooks.uponSanitizeAttribute.length > 0) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
@@ -2299,11 +2302,15 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   DOMPurify.setConfig = function (cfg = {}) {
     _parseConfig(cfg);
     SET_CONFIG = true;
+    SET_CONFIG_ALLOWED_TAGS = ALLOWED_TAGS;
+    SET_CONFIG_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    SET_CONFIG_ALLOWED_TAGS = null;
+    SET_CONFIG_ALLOWED_ATTR = null;
 
     // Drop any caller-supplied Trusted Types policy so it cannot poison later
     // `RETURN_TRUSTED_TYPE` output. The internal default policy (cached, and
@@ -2332,6 +2339,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       return;
     }
 
+    /* Reject unknown entry points. Without this, a non-hook key (e.g.
+     * '__proto__') indexes off the prototype chain rather than a real
+     * hook array, and arrayPush then writes to Object.prototype. Guard
+     * with an own-property check against the known hook names. */
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
+      return;
+    }
+
     arrayPush(hooks[entryPoint], hookFunction);
   };
 
@@ -2339,6 +2354,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     entryPoint: keyof HooksMap,
     hookFunction: HookFunction
   ) {
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
+      return undefined;
+    }
+
     if (hookFunction !== undefined) {
       const index = arrayLastIndexOf(hooks[entryPoint], hookFunction);
 
@@ -2351,6 +2370,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   };
 
   DOMPurify.removeHooks = function (entryPoint: keyof HooksMap) {
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
+      return;
+    }
+
     hooks[entryPoint] = [];
   };
 
